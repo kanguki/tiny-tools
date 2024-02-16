@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -15,63 +16,160 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 const commandConvert = "ebook-convert"
 
 func main() {
-	assertCalibreIsInstalled()
-	inputFile := flag.String("in", "", "input file")
+	input := flag.String("in", "", "input , either a file or a directory")
 	maxHintLevel := flag.Int("hint", 5, "hint level, default is 5. 1 shows fewer wordwise hints, 5 shows all wordwise hints")
-	maxDistance := flag.Int("max-distance", 1000*5, "max character distance to replace word again if it already appeared before. default is 5000, mo thinks it's ~ 1000 words")
-	parallel := flag.Int("parallel", runtime.NumCPU(), "number of batches the file is split to process, default is number of cpu")
+	parallel := flag.Int("parallel", runtime.NumCPU(), "number of files in a directory to process concurrently, default is number of cpu")
+	maxDistance := flag.Int("max-distance", 1000, "max word distance to replace word again if it already appeared before. default is 1000")
 	outFormat := flag.String("of", "epub", "output format of the wordwised book. Accept multiple formats in comma separated format. default is epub")
-	outDir := flag.String("od", "", "directory to put output files to. if empty, put it the 'wordwise' directory containing the book")
+	outDir := flag.String("od", "", "directory to put output files to. if empty, put it the 'wordwise_generated' directory containing the book")
 	flag.Parse()
-	if *inputFile == "" {
+	if *input == "" {
 		log.Println("input is empty")
-		log.Println("usage:", os.Args[0], "--in <file> [--hint <1-5> --max-distance <1000> --parallel <8> --of <epub,pdf,azw3>]")
+		log.Println("usage:", os.Args[0], "--in <file-or-dir> [--hint <1-5> --max-distance <1000> --parallel <8> --of <epub,pdf,azw3>]")
 		os.Exit(1)
 	}
-	bookpath := filepath.Dir(*inputFile)
-	bookfilename := strings.TrimSuffix(filepath.Base(*inputFile), filepath.Ext(*inputFile))
 	convertFormats := strings.Split(*outFormat, ",")
-	log.Printf("Injecting wordwise for %s, hint %d, parallel %d, output %v\n", *inputFile, *maxHintLevel, *parallel, convertFormats)
+	log.Printf("Injecting wordwise for %s, hint %d, parallel %d, max-distance %d output %v\n", *input, *maxHintLevel, *parallel, *maxDistance, convertFormats)
 
-	stopwords, err := loadStopwords("stopwords.txt")
+	exe, err := newExecutor(*maxDistance, *parallel, *maxHintLevel, *input, *outDir, "", convertFormats)
 	if err != nil {
-		log.Println("Error loading stopwords.txt:", err)
-		os.Exit(1)
+		log.Fatal("newExecutor: ", err)
 	}
+	err = exe.generateWordwise()
+	if err != nil {
+		log.Fatal("newExecutor: ", err)
+	}
+}
 
+type executor struct {
+	wordwiseDict        map[string]WordwiseEntry
+	maxDistance         int
+	maxHintLevel        int
+	outDirPath          string
+	input               string
+	generatedFolderName string
+	outFormats          []string
+	parallel            int
+}
+
+func newExecutor(maxDistance, maxHintLevel, parallel int, input, outDirPath, generatedFolderName string, outFormats []string) (*executor, error) {
+	assertCalibreIsInstalled()
 	wordwiseDict, err := loadWordwiseDict("wordwise-dict.csv")
 	if err != nil {
-		log.Println("Error loading wordwise-dict.csv:", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("loadWordwiseDict: %v", err)
 	}
+	if generatedFolderName == "" {
+		generatedFolderName = "wordwise_generated"
+	}
+	if outDirPath == "" {
+		// make a folder named generatedFolderName in the input dir
+		inputInfo, iErr := os.Stat(input)
+		if iErr != nil {
+			return nil, fmt.Errorf("os.Stat(input): %v", iErr)
+		}
+		if !inputInfo.IsDir() {
+			outDirPath = filepath.Join(filepath.Dir(input), generatedFolderName)
+		} else {
+			outDirPath = filepath.Join(input, generatedFolderName)
+		}
+	}
+	err = os.MkdirAll(outDirPath, 0765)
+	if err != nil {
+		return nil, fmt.Errorf("os.MkdirAll(outDirPath): %v", err)
+	}
+	exe := executor{
+		wordwiseDict:        wordwiseDict,
+		maxDistance:         maxDistance,
+		maxHintLevel:        maxHintLevel,
+		outDirPath:          outDirPath,
+		input:               input,
+		generatedFolderName: generatedFolderName,
+		outFormats:          outFormats,
+		parallel:            parallel,
+	}
+	return &exe, nil
+}
 
-	outTempDir := nameTempDirHtml(strings.TrimSuffix(path.Base(*inputFile), path.Ext(*inputFile)))
+func (exe *executor) listAllChildFilesIfInputIsADir() ([]string, error) {
+	inputInfo, iErr := os.Stat(exe.input)
+	if iErr != nil {
+		return nil, fmt.Errorf("os.Stat(input): %v", iErr)
+	}
+	if !inputInfo.IsDir() {
+		return []string{exe.input}, nil
+	}
+	var files []string
+	err := filepath.Walk(exe.input, func(path string, info os.FileInfo, err error) error {
+		splitPaths := strings.Split(filepath.ToSlash(path), "/")
+		for _, s := range splitPaths {
+			if s == exe.generatedFolderName {
+				// skip generated folder
+				return nil
+			}
+		}
+		if !info.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	})
+	return files, err
+}
+
+// input can be file or dir. if it's a dir, all files inside will be wordwised
+func (exe *executor) generateWordwise() error {
+	tasks := make(chan string, exe.parallel)
+	inputs, err := exe.listAllChildFilesIfInputIsADir()
+	if err != nil {
+		return fmt.Errorf("exe.listFilesInDir: %w", err)
+	}
+	go func() {
+		for _, input := range inputs {
+			tasks <- input
+		}
+	}()
+
+	eg, _ := errgroup.WithContext(context.Background())
+	for i := 0; i < len(inputs); i++ {
+		task := <-tasks
+		eg.Go(func() error {
+			return exe.generateWordwiseForAFile(task)
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return fmt.Errorf("eg.Wait: %w", err)
+	}
+	return nil
+}
+
+func (exe *executor) generateWordwiseForAFile(inFilePath string) error {
+	outTempDir := nameTempDirHtml(strings.TrimSuffix(path.Base(inFilePath), path.Ext(inFilePath)))
 	defer cleanOldTempFiles(outTempDir)
-
-	log.Println("[+] Convert Book to HTML")
-	if err := convertToHTML(*inputFile, outTempDir); err != nil {
-		log.Printf("Error converting to HTML: %v", err)
-		os.Exit(1)
+	log.Printf("[+] Convert Book to HTML, input %s", inFilePath)
+	if err := convertToHTML(inFilePath, outTempDir); err != nil {
+		log.Fatalf("Error converting to HTML: %v", err)
 	}
 
 	outTempHtml := path.Join(outTempDir, "index1.html")
 	log.Println("[+] Load Book Contents")
 	bookContent, err := os.ReadFile(outTempHtml)
 	if err != nil {
-		log.Println("Error loading book content:", err)
-		os.Exit(1)
+		log.Fatalf("Error loading book content: %v", err)
 	}
 	start, stop := 0, len(bookContent)
 
-	mediator := newReplacementMediator(*maxDistance)
+	mediator := newReplacementMediator(exe.maxDistance)
 	log.Println("[+] Start replacing")
+	position := 0
 	replaceWord := func(start int) (replacedWord string, nextStart int) {
 		next := strings.Index(string(bookContent[start:]), " ")
+		position++
 		if next == -1 { // EOF
 			return string(bookContent[start:]), -1
 		}
@@ -82,16 +180,14 @@ func main() {
 		word := cleanWord(originalWord)
 		start += next
 		keyword := strings.ToLower(word)
-		_, isStopword := stopwords[keyword]
-		wordwise, isAWordWise := wordwiseDict[keyword]
+		wordwise, isAWordWise := exe.wordwiseDict[keyword]
 		if word == "" || // non-word string
-			isStopword ||
 			!isAWordWise ||
-			wordwise.HintLevel > *maxHintLevel ||
-			mediator.hasReplacedJustNow(keyword, start) {
+			wordwise.HintLevel > exe.maxHintLevel ||
+			mediator.hasReplacedJustNow(keyword, position) {
 			return originalWord, start
 		}
-		mediator.setLastReplacedPosition(keyword, start)
+		mediator.setLastReplacedPosition(keyword, position)
 		newWord := strings.ReplaceAll(originalWord, word, fmt.Sprintf("<ruby>%s<rt>%s</rt></ruby>", word, wordwise.ShortDef))
 		return newWord, start
 	}
@@ -108,33 +204,22 @@ func main() {
 
 	log.Println("[+] Done replacing. Writing replaced words back to temp html file")
 	if err := os.WriteFile(outTempHtml, []byte(wordwisedContent), 0644); err != nil {
-		log.Println("Error creating new book content with Wordwised:", err)
-		os.Exit(1)
+		log.Fatalf("Error creating new book content with Wordwised: %v", err)
 	}
 
-	log.Printf("[+] Converting html to %v\n", convertFormats)
-	for _, format := range convertFormats {
-		outDir := *outDir
-		if outDir == "" {
-			outDir = path.Join(bookpath, "wordwise")
-		}
-		err = os.MkdirAll(outDir, 0765)
-		if err != nil {
-			log.Printf("creating out dir: %v\n", err)
-			os.Exit(1)
-		}
-		outputFilename := path.Join(outDir, bookfilename+"."+format)
+	log.Printf("[+] Converting html to %v\n", exe.outFormats)
+	for _, format := range exe.outFormats {
+		bookfilename := strings.TrimSuffix(filepath.Base(inFilePath), filepath.Ext(inFilePath))
+		outputFilename := path.Join(exe.outDirPath, bookfilename+"."+format)
 		var opts []string
-		// if format == "epub" {
-		// 	opts = append(opts, "--preserve-cover-aspect-ratio")
-		// }
 		if err := convert(outTempHtml, outputFilename, opts...); err != nil {
 			log.Printf("Error converting %s to %s: %v\n", outTempHtml, format, err)
 		}
 		log.Printf("output %s to \"%s\"\n", format, outputFilename)
 	}
 
-	log.Printf("[+] %d books %v with wordwise generation done!", len(convertFormats), convertFormats)
+	log.Printf("[+] %d books %v with wordwise generation done!", len(exe.outFormats), exe.outFormats)
+	return nil
 }
 
 // replacementMediator helps limits too many replacement for one word standing near each other
@@ -185,18 +270,6 @@ func atoi(s string) int {
 		n = n*10 + int(c-'0')
 	}
 	return n
-}
-
-func loadStopwords(filename string) (map[string]struct{}, error) {
-	stopwords, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, err
-	}
-	ret := map[string]struct{}{}
-	for _, word := range strings.Split(string(stopwords), "\n") {
-		ret[word] = struct{}{}
-	}
-	return ret, nil
 }
 
 func loadWordwiseDict(filename string) (map[string]WordwiseEntry, error) {
@@ -255,9 +328,9 @@ func assertCalibreIsInstalled() {
 	}
 }
 
-func convertToHTML(inputFile string, outputDir string) error {
+func convertToHTML(input string, outputDir string) error {
 	tempHtmlz := time.Now().Format("20060102150405") + "book_dump.htmlz"
-	err := convert(inputFile, tempHtmlz)
+	err := convert(input, tempHtmlz)
 	if err != nil {
 		return fmt.Errorf("convert to htmlz: %w", err)
 	}
@@ -277,9 +350,9 @@ func convertToHTML(inputFile string, outputDir string) error {
 
 // convert picks up file name and do the convert
 // eg.g convert(xxx.epub, yyy.pdf)
-func convert(inputFile, outputFile string, opts ...string) error {
+func convert(input, outputFile string, opts ...string) error {
 	errBuf := bytes.NewBuffer(nil)
-	cmdOpts := []string{inputFile, outputFile}
+	cmdOpts := []string{input, outputFile}
 	if opts != nil {
 		cmdOpts = append(cmdOpts, opts...)
 	}
