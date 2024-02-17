@@ -114,7 +114,8 @@ func (exe *executor) listAllChildFilesIfInputIsADir() ([]string, error) {
 				return nil
 			}
 		}
-		if !info.IsDir() {
+		// skip dirs and hidden files
+		if !info.IsDir() && !strings.HasPrefix(filepath.Base(path), ".") {
 			files = append(files, path)
 		}
 		return nil
@@ -149,7 +150,7 @@ func (exe *executor) generateWordwise() error {
 }
 
 func (exe *executor) generateWordwiseForAFile(inFilePath string) error {
-	outTempDir := nameTempDirHtml(strings.TrimSuffix(path.Base(inFilePath), path.Ext(inFilePath)))
+	outTempDir := normalizePathToAValidPath(strings.TrimSuffix(path.Base(inFilePath), path.Ext(inFilePath)))
 	defer cleanOldTempFiles(outTempDir)
 	log.Printf("[+] Convert Book to HTML, input %s", inFilePath)
 	if err := convertToHTML(inFilePath, outTempDir); err != nil {
@@ -269,7 +270,7 @@ func (r *replacementMediator) setLastReplacedPosition(word string, postion int) 
 	r.lastReplacedPosition[word] = postion
 }
 
-func nameTempDirHtml(input string) string {
+func normalizePathToAValidPath(input string) string {
 	re_leadclose_whtsp := regexp.MustCompile(`^[\s\p{Zs}]+|[\s\p{Zs}]+$`)
 	re_inside_whtsp := regexp.MustCompile(`[\s\p{Zs}]{2,}`)
 	specialChars := regexp.MustCompile(`[^a-zA-Z0-9]`)
@@ -344,7 +345,7 @@ func assertCalibreIsInstalled() {
 }
 
 func convertToHTML(input string, outputDir string) error {
-	tempHtmlz := time.Now().Format("20060102150405") + "book_dump.htmlz"
+	tempHtmlz := time.Now().Format("20060102150405") + outputDir + "_book_dump.htmlz"
 	err := convert(input, tempHtmlz)
 	if err != nil {
 		return fmt.Errorf("convert to htmlz: %w", err)
