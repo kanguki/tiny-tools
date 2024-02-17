@@ -32,7 +32,7 @@ func main() {
 	flag.Parse()
 	if *input == "" {
 		log.Println("input is empty")
-		log.Println("usage:", os.Args[0], "--in <file-or-dir> [--hint <1-5> --max-distance <1000> --parallel <8> --of <epub,pdf,azw3>]")
+		log.Println("usage:", os.Args[0], "--in <file-or-dir> [--od <out-dir-default-generated> --hint <1-5> --max-distance <1000> --parallel <8> --of <epub,pdf,azw3>]")
 		os.Exit(1)
 	}
 	convertFormats := strings.Split(*outFormat, ",")
@@ -207,13 +207,28 @@ func (exe *executor) generateWordwiseForAFile(inFilePath string) error {
 		log.Fatalf("Error creating new book content with Wordwised: %v", err)
 	}
 
-	log.Printf("[+] Converting html to %v\n", exe.outFormats)
-	for _, format := range exe.outFormats {
+	for i, format := range exe.outFormats {
+		log.Printf("[+] (%d/%d) Converting html to %s\n", i+1, len(exe.outFormats), format)
 		bookfilename := strings.TrimSuffix(filepath.Base(inFilePath), filepath.Ext(inFilePath))
 		outputFilename := path.Join(exe.outDirPath, bookfilename+"."+format)
 		var opts []string
+		if format == "pdf" {
+			opts = []string{"--pdf-page-numbers",
+				"--paper-size=a5",
+				"--pdf-mono-font-size=14",
+				"--pdf-default-font-size=14",
+				"--pdf-page-margin-top=60",
+				"--pdf-page-margin-bottom=60",
+				"--pdf-page-margin-left=60",
+				"--pdf-page-margin-right=60",
+			}
+			// keep original cover if any
+			if _, err := os.Stat(filepath.Join(outTempDir, "cover.jpg")); !os.IsNotExist(err) || err == nil {
+				opts = append(opts, "--cover", filepath.Join(outTempDir, "cover.jpg"))
+			}
+		}
 		if err := convert(outTempHtml, outputFilename, opts...); err != nil {
-			log.Printf("Error converting %s to %s: %v\n", outTempHtml, format, err)
+			return fmt.Errorf("Error converting %s to %s: %w\n", outTempHtml, format, err)
 		}
 		log.Printf("output %s to \"%s\"\n", format, outputFilename)
 	}
