@@ -181,8 +181,9 @@ func (exe *executor) generateWordwiseForAFile(inFilePath string) error {
 		word := cleanWord(originalWord)
 		start += next
 		keyword := strings.ToLower(word)
+		keyword = exe.findPossibleStemWord(keyword)
 		wordwise, isAWordWise := exe.wordwiseDict[keyword]
-		if word == "" || // non-word string
+		if keyword == "" || // non-word string
 			!isAWordWise ||
 			wordwise.HintLevel > exe.maxHintLevel ||
 			mediator.hasReplacedJustNow(keyword, position) {
@@ -236,6 +237,36 @@ func (exe *executor) generateWordwiseForAFile(inFilePath string) error {
 
 	log.Printf("[+] %d books %v with wordwise generation done!", len(exe.outFormats), exe.outFormats)
 	return nil
+}
+
+// findPossibleStemWord try to find a wordwise from a word by replacing its suffices
+// with common conjugation rules
+func (exe *executor) findPossibleStemWord(word string) string {
+	_, isAWordWise := exe.wordwiseDict[word]
+	if isAWordWise {
+		return word
+	}
+	replaceSuffixAndCheck := func(word, oldSuffix, newSuffix string) (string, bool) {
+		if !strings.HasSuffix(word, oldSuffix) {
+			return word, false
+		}
+		word = strings.TrimRight(word, oldSuffix) + newSuffix
+		_, isAWordWise = exe.wordwiseDict[word]
+		return word, isAWordWise
+	}
+	suffixPairs := [][]string{
+		{"ies", "y"}, {"es", ""}, {"s", ""},
+		{"ying", "ie"}, {"ing", ""}, {"ing", "e"},
+		{"ied", "y"}, {"ed", ""}, {"ed", "d"},
+	}
+	correctedWord := word
+	for _, pair := range suffixPairs {
+		correctedWord, isAWordWise = replaceSuffixAndCheck(word, pair[0], pair[1])
+		if isAWordWise {
+			break
+		}
+	}
+	return correctedWord
 }
 
 // replacementMediator helps limits too many replacement for one word standing near each other
@@ -385,7 +416,7 @@ func cleanWord(word string) string {
 	res := strings.TrimSpace(word)
 
 	// Strip special characters
-	specialChars := ",<>;*&~/\"[]#?`–.'\"!“”:."
+	specialChars := ",<>;*&~/\"[]#?`.'\"!“”:."
 	for _, char := range specialChars {
 		res = strings.ReplaceAll(res, string(char), "")
 	}

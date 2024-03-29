@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestExecutor(t *testing.T) {
@@ -103,5 +104,53 @@ func TestReplacementMediator(t *testing.T) {
 	}
 	if m.hasReplacedJustNow(word, 12) {
 		t.Fatalf("%s was replaced at 1 is expected to be replaced at postion >= 11 (12 > 11)", word)
+	}
+}
+
+func TestFindPossibleStemWord(t *testing.T) {
+	exe, err := newExecutor(1000, 5, 4, ".", "", "wordwise_generated", nil)
+	if err != nil {
+		t.Fatalf("newExecutor: %v", err)
+	}
+	for _, test := range []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "_ed",
+			input: "abbeyed",
+			want:  "abbey",
+		},
+		{
+			name:  "_s",
+			input: "abductors",
+			want:  "abductor",
+		},
+		{
+			name:  "s-but-keep-as-is",
+			input: "accoustics",
+			want:  "accoustics",
+		},
+		{
+			name:  "_es",
+			input: "adages",
+			want:  "adage",
+		},
+		{
+			name:  "_ing",
+			input: "acclaiming",
+			want:  "acclaim",
+		},
+		{
+			name:  "not a wordwise",
+			input: "ksjdfjkhsdkf",
+			want:  "ksjdfjkhsdkf",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := exe.findPossibleStemWord(test.input)
+			require.Equal(t, test.want, got)
+		})
 	}
 }
