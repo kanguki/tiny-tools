@@ -27,7 +27,7 @@ func TestExecutor(t *testing.T) {
 			outDir:       "",
 			outFormats:   []string{"mobi"},
 			wantOutDir:   "./testdata/wordwise_generated",
-			wantOutFiles: []string{"./testdata/wordwise_generated/test-wordwise-gen1.mobi", "./testdata/wordwise_generated/test-wordwise-gen2.mobi"},
+			wantOutFiles: []string{"./testdata/wordwise_generated/test-wordwise-gen1.mobi", "./testdata/wordwise_generated/test-wordwise-gen2.mobi", ""},
 		},
 		{
 			name:         "input is a file and only that file is processed",
@@ -39,7 +39,7 @@ func TestExecutor(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			exe, err := newExecutor(1000, 5, 4, test.input, test.outDir, "wordwise_generated", test.outFormats)
+			exe, err := newExecutor(1000, 5, 4, test.input, test.outDir, "wordwise_generated", test.outFormats, "a5", "")
 			if err != nil {
 				t.Fatalf("newExecutor: %v", err)
 			}
@@ -79,7 +79,7 @@ func TestListAllChildFilesIfInputIsADir(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			exe, err := newExecutor(1000, 5, 4, test.input, "", "wordwise_generated", nil)
+			exe, err := newExecutor(1000, 5, 4, test.input, "", "wordwise_generated", nil, "a5", "")
 			if err != nil {
 				t.Fatalf("newExecutor: %v", err)
 			}
@@ -108,7 +108,7 @@ func TestReplacementMediator(t *testing.T) {
 }
 
 func TestFindPossibleStemWord(t *testing.T) {
-	exe, err := newExecutor(1000, 5, 4, ".", "", "wordwise_generated", nil)
+	exe, err := newExecutor(1000, 5, 4, ".", "", "wordwise_generated", nil, "a5", "")
 	if err != nil {
 		t.Fatalf("newExecutor: %v", err)
 	}

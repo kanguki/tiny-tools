@@ -29,6 +29,8 @@ func main() {
 	maxDistance := flag.Int("max-distance", 1000, "max word distance to replace word again if it already appeared before. default is 1000")
 	outFormat := flag.String("of", "epub", "output format of the wordwised book. Accept multiple formats in comma separated format. default is epub")
 	outDir := flag.String("od", "", "directory to put output files to. if empty, put it the 'wordwise_generated' directory containing the book")
+	pdfSize := flag.String("pdf-size", "", "size of pdf if output is pdf, supported are a5, b5, a4, default is a5")
+	keepCoversIn := flag.String("keep-covers-in", "", "directory to keep covers in. if empty, dont keep covers.")
 	flag.Parse()
 	if *input == "" {
 		log.Println("input is empty")
@@ -38,7 +40,7 @@ func main() {
 	convertFormats := strings.Split(*outFormat, ",")
 	log.Printf("Injecting wordwise for %s, hint %d, parallel %d, max-distance %d output %v\n", *input, *maxHintLevel, *parallel, *maxDistance, convertFormats)
 
-	exe, err := newExecutor(*maxDistance, *parallel, *maxHintLevel, *input, *outDir, "", convertFormats)
+	exe, err := newExecutor(*maxDistance, *parallel, *maxHintLevel, *input, *outDir, "", convertFormats, *pdfSize, *keepCoversIn)
 	if err != nil {
 		log.Fatal("newExecutor: ", err)
 	}
@@ -57,9 +59,11 @@ type executor struct {
 	generatedFolderName string
 	outFormats          []string
 	parallel            int
+	pdfSize             string
+	keepCoversIn        string
 }
 
-func newExecutor(maxDistance, maxHintLevel, parallel int, input, outDirPath, generatedFolderName string, outFormats []string) (*executor, error) {
+func newExecutor(maxDistance, maxHintLevel, parallel int, input, outDirPath, generatedFolderName string, outFormats []string, pdfSize, keepCoversIn string) (*executor, error) {
 	assertCalibreIsInstalled()
 	wordwiseDict, err := loadWordwiseDict("wordwise-dict.csv")
 	if err != nil {
@@ -93,6 +97,8 @@ func newExecutor(maxDistance, maxHintLevel, parallel int, input, outDirPath, gen
 		generatedFolderName: generatedFolderName,
 		outFormats:          outFormats,
 		parallel:            parallel,
+		pdfSize:             pdfSize,
+		keepCoversIn:        keepCoversIn,
 	}
 	return &exe, nil
 }
@@ -150,6 +156,7 @@ func (exe *executor) generateWordwise() error {
 }
 
 func (exe *executor) generateWordwiseForAFile(inFilePath string) error {
+	startTime := time.Now()
 	outTempDir := normalizePathToAValidPath(strings.TrimSuffix(path.Base(inFilePath), path.Ext(inFilePath)))
 	defer cleanOldTempFiles(outTempDir)
 	log.Printf("[+] Convert Book to HTML, input %s", inFilePath)
@@ -214,20 +221,53 @@ func (exe *executor) generateWordwiseForAFile(inFilePath string) error {
 		bookfilename := strings.TrimSuffix(filepath.Base(inFilePath), filepath.Ext(inFilePath))
 		outputFilename := path.Join(exe.outDirPath, bookfilename+"."+format)
 		var opts []string
+		// keep original cover if any
+		originalCover := filepath.Join(outTempDir, "cover.jpg")
+		if _, err := os.Stat(originalCover); !os.IsNotExist(err) || err == nil {
+			opts = append(opts, "--cover", originalCover)
+			if exe.keepCoversIn != "" {
+				if err := os.MkdirAll(outTempDir, 0765); err != nil {
+					return fmt.Errorf("os.MkdirAll(%s): %w", outTempDir, err)
+				}
+				if err := copyFile(originalCover, filepath.Join(exe.keepCoversIn, bookfilename+".jpg")); err != nil {
+					return fmt.Errorf("copyFile(%s, %s): %w", originalCover, exe.keepCoversIn, err)
+				}
+			}
+		}
 		if format == "pdf" {
-			opts = []string{"--pdf-page-numbers",
-				"--paper-size=a5",
-				"--pdf-mono-font-size=14",
-				"--pdf-default-font-size=14",
-				"--pdf-page-margin-top=60",
-				"--pdf-page-margin-bottom=60",
-				"--pdf-page-margin-left=60",
-				"--pdf-page-margin-right=60",
+			opts = append(opts, "--enable-heuristics", "--pdf-page-numbers")
+			switch exe.pdfSize {
+			case "b5":
+				opts = append(opts, []string{
+					"--paper-size=b5",
+					"--pdf-mono-font-size=15",
+					"--pdf-default-font-size=15",
+					"--pdf-page-margin-top=60",
+					"--pdf-page-margin-bottom=60",
+					"--pdf-page-margin-left=65",
+					"--pdf-page-margin-right=65",
+				}...)
+			case "a4":
+				opts = append(opts, []string{
+					"--paper-size=a4",
+					"--pdf-mono-font-size=15",
+					"--pdf-default-font-size=15",
+					"--pdf-page-margin-top=60",
+					"--pdf-page-margin-bottom=60",
+					"--pdf-page-margin-left=65",
+					"--pdf-page-margin-right=65",
+				}...)
+			default:
+				opts = append(opts, []string{
+					"--paper-size=a5",
+					"--pdf-mono-font-size=14",
+					"--pdf-default-font-size=14",
+					"--pdf-page-margin-top=60",
+					"--pdf-page-margin-bottom=60",
+					"--pdf-page-margin-left=60",
+				}...)
 			}
-			// keep original cover if any
-			if _, err := os.Stat(filepath.Join(outTempDir, "cover.jpg")); !os.IsNotExist(err) || err == nil {
-				opts = append(opts, "--cover", filepath.Join(outTempDir, "cover.jpg"))
-			}
+
 		}
 		if err := convert(outTempHtml, outputFilename, opts...); err != nil {
 			return fmt.Errorf("Error converting %s to %s: %w\n", outTempHtml, format, err)
@@ -235,7 +275,19 @@ func (exe *executor) generateWordwiseForAFile(inFilePath string) error {
 		log.Printf("output %s to \"%s\"\n", format, outputFilename)
 	}
 
-	log.Printf("[+] %d books %v with wordwise generation done!", len(exe.outFormats), exe.outFormats)
+	log.Printf("[+] %d books %v with wordwise generation done! Took %.2f seconds.", len(exe.outFormats), exe.outFormats, time.Since(startTime).Seconds())
+	return nil
+}
+
+func copyFile(src string, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("ioutil.ReadFile: %w", err)
+	}
+	err = os.WriteFile(dst, data, 0644)
+	if err != nil {
+		return fmt.Errorf("ioutil.ReadFile: %w", err)
+	}
 	return nil
 }
 
@@ -258,6 +310,7 @@ func (exe *executor) findPossibleStemWord(word string) string {
 		{"ies", "y"}, {"es", ""}, {"s", ""},
 		{"ying", "ie"}, {"ing", ""}, {"ing", "e"},
 		{"ied", "y"}, {"ed", ""}, {"ed", "d"},
+		{"ly", ""},
 	}
 	correctedWord := word
 	for _, pair := range suffixPairs {
