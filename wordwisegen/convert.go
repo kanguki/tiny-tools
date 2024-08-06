@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/atomic"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -34,7 +35,7 @@ func main() {
 	flag.Parse()
 	if *input == "" {
 		log.Println("input is empty")
-		log.Println("usage:", os.Args[0], "--in <file-or-dir> [--od <out-dir-default-generated> --hint <1-5> --max-distance <1000> --parallel <8> --of <epub,pdf,azw3>]")
+		log.Println("usage:", os.Args[0], "--in <file-or-dir> [--od <out-dir-default-generated> --hint <1-5> --max-distance <1000> --parallel <8> --of <epub,pdf,azw3> --pdf-size <a5,b5,a4> --keep-covers-in <dir>]")
 		os.Exit(1)
 	}
 	convertFormats := strings.Split(*outFormat, ",")
@@ -61,6 +62,8 @@ type executor struct {
 	parallel            int
 	pdfSize             string
 	keepCoversIn        string
+	currentCount        atomic.Int64
+	countTotal          int
 }
 
 func newExecutor(maxDistance, maxHintLevel, parallel int, input, outDirPath, generatedFolderName string, outFormats []string, pdfSize, keepCoversIn string) (*executor, error) {
@@ -131,24 +134,29 @@ func (exe *executor) listAllChildFilesIfInputIsADir() ([]string, error) {
 
 // input can be file or dir. if it's a dir, all files inside will be wordwised
 func (exe *executor) generateWordwise() error {
-	tasks := make(chan string, exe.parallel)
+	tasks := make(chan string)
 	inputs, err := exe.listAllChildFilesIfInputIsADir()
 	if err != nil {
 		return fmt.Errorf("exe.listFilesInDir: %w", err)
 	}
-	go func() {
-		for _, input := range inputs {
-			tasks <- input
-		}
-	}()
-
+	exe.countTotal = len(inputs)
 	eg, _ := errgroup.WithContext(context.Background())
-	for i := 0; i < len(inputs); i++ {
-		task := <-tasks
+	for i := 0; i < exe.parallel; i++ {
 		eg.Go(func() error {
-			return exe.generateWordwiseForAFile(task)
+			for task := range tasks {
+				err = exe.generateWordwiseForAFile(task)
+				if err != nil {
+					return fmt.Errorf("exe.generateWordwiseForAFile: %w", err)
+				}
+				exe.currentCount.Inc()
+			}
+			return nil
 		})
 	}
+	for _, input := range inputs {
+		tasks <- input
+	}
+	close(tasks)
 	if err := eg.Wait(); err != nil {
 		return fmt.Errorf("eg.Wait: %w", err)
 	}
@@ -157,7 +165,7 @@ func (exe *executor) generateWordwise() error {
 
 func (exe *executor) generateWordwiseForAFile(inFilePath string) error {
 	startTime := time.Now()
-	outTempDir := normalizePathToAValidPath(strings.TrimSuffix(path.Base(inFilePath), path.Ext(inFilePath)))
+	outTempDir := path.Join("temp", normalizePathToAValidPath(strings.TrimSuffix(path.Base(inFilePath), path.Ext(inFilePath))))
 	defer cleanOldTempFiles(outTempDir)
 	log.Printf("[+] Convert Book to HTML, input %s", inFilePath)
 	if err := convertToHTML(inFilePath, outTempDir); err != nil {
@@ -275,7 +283,7 @@ func (exe *executor) generateWordwiseForAFile(inFilePath string) error {
 		log.Printf("output %s to \"%s\"\n", format, outputFilename)
 	}
 
-	log.Printf("[+] %d books %v with wordwise generation done! Took %.2f seconds.", len(exe.outFormats), exe.outFormats, time.Since(startTime).Seconds())
+	log.Printf("[+] (%d/%d) book %v with wordwise generation done! Took %.2f seconds.", exe.currentCount.Load(), exe.countTotal, inFilePath, time.Since(startTime).Seconds())
 	return nil
 }
 
@@ -413,6 +421,7 @@ func loadWordwiseDict(filename string) (map[string]WordwiseEntry, error) {
 }
 
 func cleanOldTempFiles(path string) error {
+	fmt.Printf("cleaning %s\n", path)
 	if err := os.RemoveAll(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -429,8 +438,13 @@ func assertCalibreIsInstalled() {
 }
 
 func convertToHTML(input string, outputDir string) error {
-	tempHtmlz := time.Now().Format("20060102150405") + outputDir + "_book_dump.htmlz"
-	err := convert(input, tempHtmlz)
+	tempHtmlzDir := path.Join("temphtmlz", outputDir)
+	tempHtmlz := path.Join(tempHtmlzDir, time.Now().Format("20060102150405")+"_book_dump.htmlz")
+	err := os.MkdirAll(tempHtmlzDir, 0765)
+	if err != nil {
+		return fmt.Errorf("os.MkdirAll tempHtmlz: %w", err)
+	}
+	err = convert(input, tempHtmlz)
 	if err != nil {
 		return fmt.Errorf("convert to htmlz: %w", err)
 	}
@@ -442,7 +456,7 @@ func convertToHTML(input string, outputDir string) error {
 	if _, err := os.Stat(outputHtml); os.IsNotExist(err) {
 		log.Fatalf("expect output %s to be generated after converting htmlz to html, but it doesn't exist", outputHtml)
 	}
-	if err = os.RemoveAll(tempHtmlz); err != nil && !os.IsNotExist(err) {
+	if err = os.RemoveAll(tempHtmlzDir); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove %s: %w", tempHtmlz, err)
 	}
 	return nil
